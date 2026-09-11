@@ -63,19 +63,29 @@ async function main(){
   function newTimingWindow(){return {sourceSamples:0,maxAbsGridOffsetMs:0,over50SourceSamples:0,maxAssetSkewMs:0,maxSkewByAsset:{BTC:0,ETH:0,SOL:0},missedSchedulerSlots:0};}
   function sampleAt(target){
     const actualByAsset={BTC:[],ETH:[],SOL:[]};
+    const captured=[];
     const sec=Math.floor(target/1000)%60;
+
+    // Node 的 feed 更新與此同步 callback 不會交錯執行；先快速為所有 ready
+    // 來源各自捕捉 actualTs，再做較昂貴的 shell 計算，才能讓時間戳代表
+    // 同一個邏輯 book-state sampling instant，而不是計算順序耗時。
     for(const s of sourceMap.values()){
       if(!s.broadBook?.ready)continue;
       const actual=Date.now();
+      captured.push({s,actual});
       const offset=Math.abs(actual-target);
       timingWindow.sourceSamples++;
       timingWindow.maxAbsGridOffsetMs=Math.max(timingWindow.maxAbsGridOffsetMs,offset);
       if(offset>50)timingWindow.over50SourceSamples++;
       actualByAsset[s.asset]?.push(actual);
+    }
+
+    for(const {s,actual} of captured){
       const near=makeDepthSample(s,actual,'near');if(near)writer.add(s.venue,s.asset,near);
       if(sec%2===0){const mid=makeDepthSample(s,actual,'mid');if(mid)writer.add(s.venue,s.asset,mid);}
       if(sec%5===0){const far=makeDepthSample(s,actual,'far');if(far)writer.add(s.venue,s.asset,far);const p=makePersistenceSample(s,actual);if(p)writer.add(s.venue,s.asset,p);}
     }
+
     for(const [asset,xs] of Object.entries(actualByAsset)){
       if(xs.length<2)continue;
       const skew=Math.max(...xs)-Math.min(...xs);

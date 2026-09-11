@@ -33,6 +33,7 @@ async function main(){
   const manifest=new Manifest(runId,segmentStartMs);await manifest.init();
   let status='STARTING',stopReason=null,stopping=false;
   const sourceMap=new Map(),feeds=[];
+  let timingWindow=newTimingWindow();
 
   console.log(JSON.stringify({kind:'collector-start',collectionId:collection.data.collectionId,runId,segmentStartIso:new Date(segmentStartMs).toISOString(),collectionStartIso:collection.data.startIso,datasetDir:DATASET_DIR,capacityBytes:CAPACITY_BYTES,reserveBytes:STOP_RESERVE_BYTES}));
 
@@ -59,14 +60,27 @@ async function main(){
   const state=()=>({status,collectionId:collection.data.collectionId,runId,segmentStartMs,segmentStartIso:new Date(segmentStartMs).toISOString(),collectionStartMs:collection.data.startMs,collectionStartIso:collection.data.startIso,collectionElapsedMs:Date.now()-collection.data.startMs,volumeBytes,datasetBytes,capacityBytes:CAPACITY_BYTES,reserveBytes:STOP_RESERVE_BYTES,estimatedNextBatchBytes:writer.estimatedNextBatchBytes(),stopReason,segments:collection.data.segments.length,sources:sourceSummary()});
   startHttp(state);
 
+  function newTimingWindow(){return {sourceSamples:0,maxAbsGridOffsetMs:0,over50SourceSamples:0,maxAssetSkewMs:0,maxSkewByAsset:{BTC:0,ETH:0,SOL:0},missedSchedulerSlots:0};}
   function sampleAt(target){
-    const actual=Date.now();
+    const actualByAsset={BTC:[],ETH:[],SOL:[]};
+    const sec=Math.floor(target/1000)%60;
     for(const s of sourceMap.values()){
       if(!s.broadBook?.ready)continue;
-      const sec=Math.floor(target/1000)%60;
+      const actual=Date.now();
+      const offset=Math.abs(actual-target);
+      timingWindow.sourceSamples++;
+      timingWindow.maxAbsGridOffsetMs=Math.max(timingWindow.maxAbsGridOffsetMs,offset);
+      if(offset>50)timingWindow.over50SourceSamples++;
+      actualByAsset[s.asset]?.push(actual);
       const near=makeDepthSample(s,actual,'near');if(near)writer.add(s.venue,s.asset,near);
       if(sec%2===0){const mid=makeDepthSample(s,actual,'mid');if(mid)writer.add(s.venue,s.asset,mid);}
       if(sec%5===0){const far=makeDepthSample(s,actual,'far');if(far)writer.add(s.venue,s.asset,far);const p=makePersistenceSample(s,actual);if(p)writer.add(s.venue,s.asset,p);}
+    }
+    for(const [asset,xs] of Object.entries(actualByAsset)){
+      if(xs.length<2)continue;
+      const skew=Math.max(...xs)-Math.min(...xs);
+      timingWindow.maxSkewByAsset[asset]=Math.max(timingWindow.maxSkewByAsset[asset],skew);
+      timingWindow.maxAssetSkewMs=Math.max(timingWindow.maxAssetSkewMs,skew);
     }
   }
 
@@ -74,7 +88,11 @@ async function main(){
   const tick=async()=>{
     if(stopping)return;
     const now=Date.now();
-    while(next<=now+20){if(Math.abs(now-next)<=50)sampleAt(next);next+=1000;}
+    while(next<=now){
+      const late=now-next;
+      if(late<=50)sampleAt(next);else timingWindow.missedSchedulerSlots++;
+      next+=1000;
+    }
     const files=await writer.flushClosed(now);
     if(files.length){
       manifest.addFiles(files);await manifest.save();
@@ -84,13 +102,13 @@ async function main(){
       if(volumeBytes+need>=CAPACITY_BYTES)return stop('STORAGE_LIMIT',true);
     }
     if(now-collection.data.startMs>=MAX_RUN_MS)return stop('TEN_DAY_LIMIT',true);
-    setTimeout(tick,Math.max(10,next-Date.now()-5));
+    setTimeout(tick,Math.max(1,next-Date.now()));
   };
   tick();
 
   const telemetry=setInterval(()=>{
-    const s=state();const vals=Object.values(s.sources);
-    console.log(JSON.stringify({kind:'collector-status',ts:new Date().toISOString(),status:s.status,collectionId:s.collectionId,runId:s.runId,readyCount:vals.filter(x=>x.ready).length,nearReadyCount:vals.filter(x=>x.nearReady).length,totalSources:vals.length,volumeBytes:s.volumeBytes,datasetBytes:s.datasetBytes,estimatedNextBatchBytes:s.estimatedNextBatchBytes,sources:s.sources}));
+    const s=state();const vals=Object.values(s.sources);const timing=timingWindow;timingWindow=newTimingWindow();
+    console.log(JSON.stringify({kind:'collector-status',ts:new Date().toISOString(),status:s.status,collectionId:s.collectionId,runId:s.runId,readyCount:vals.filter(x=>x.ready).length,nearReadyCount:vals.filter(x=>x.nearReady).length,totalSources:vals.length,volumeBytes:s.volumeBytes,datasetBytes:s.datasetBytes,estimatedNextBatchBytes:s.estimatedNextBatchBytes,timing,sources:s.sources}));
   },30_000);telemetry.unref();
 
   async function stop(reason,finalCollection){

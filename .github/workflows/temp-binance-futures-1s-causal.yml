@@ -1,0 +1,97 @@
+name: temp-binance-futures-1s-causal
+on:
+  push:
+    paths:
+      - '.github/workflows/temp-binance-futures-1s-causal.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Download and aggregate causal Binance USD-M aggTrades
+        shell: bash
+        run: |
+          python - <<'PYCODE'
+          import csv, gzip, hashlib, io, json, math, os, urllib.request, zipfile
+          from datetime import date, timedelta
+
+          START_MS=1789125439000
+          END_MS=1789607099000
+          ASSETS=['BTC','ETH','SOL']
+          BASE='https://data.binance.vision/data/futures/um/daily/aggTrades'
+          OUT='binance_futures_1s_causal.csv.gz'
+          MAN='binance_futures_1s_causal_manifest.json'
+
+          def dates():
+              d=date(2026,9,11); e=date(2026,9,17)
+              while d<=e:
+                  yield d.isoformat(); d+=timedelta(days=1)
+
+          def download(url,path):
+              req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'})
+              with urllib.request.urlopen(req,timeout=180) as r, open(path,'wb') as f:
+                  while True:
+                      b=r.read(1024*1024)
+                      if not b: break
+                      f.write(b)
+
+          manifest={'start_ms':START_MS,'end_ms':END_MS,'definition':'At each exact second T, use the most recent Binance USD-M aggTrade with trade timestamp <= T. No future trades within the second are used.','source':'Binance Public Data futures/um/daily/aggTrades','assets':{}}
+          expected_rows=(END_MS-START_MS)//1000+1
+          with gzip.open(OUT,'wt',newline='',encoding='utf-8') as outf:
+              w=csv.writer(outf)
+              w.writerow(['asset','timestamp_ms','last_price','last_trade_ts_ms','price_age_ms'])
+              for asset in ASSETS:
+                  symbol=asset+'USDT'; next_t=START_MS; last_price=float('nan'); last_ts=-1
+                  infos=[]; rows_out=0; missing=0; max_age=-1; trades_in_range=0; done=False
+                  for ds in dates():
+                      fn=f'{symbol}-aggTrades-{ds}.zip'; url=f'{BASE}/{symbol}/{fn}'; c_url=url+'.CHECKSUM'
+                      print('download',url,flush=True)
+                      download(url,fn); download(c_url,fn+'.CHECKSUM')
+                      sha=hashlib.sha256(open(fn,'rb').read()).hexdigest(); expected=open(fn+'.CHECKSUM').read().strip().split()[0]
+                      if sha.lower()!=expected.lower(): raise RuntimeError(f'checksum mismatch {fn}')
+                      parsed=0
+                      with zipfile.ZipFile(fn) as z:
+                          names=[x for x in z.namelist() if x.lower().endswith('.csv')] or z.namelist()
+                          with z.open(names[0]) as bf:
+                              r=csv.reader(io.TextIOWrapper(bf,encoding='utf-8',newline=''))
+                              for row in r:
+                                  if not row: continue
+                                  try: price=float(row[1]); ts=int(row[5])
+                                  except (ValueError,IndexError): continue
+                                  if ts>10**14: ts//=1000
+                                  parsed+=1
+                                  while next_t<=END_MS and next_t < ts:
+                                      if last_ts<0 or not math.isfinite(last_price):
+                                          age=-1; missing+=1; p='nan'
+                                      else:
+                                          age=next_t-last_ts; max_age=max(max_age,age); p=format(last_price,'.12g')
+                                      w.writerow([asset,next_t,p,last_ts,age]); rows_out+=1; next_t+=1000
+                                  if ts>END_MS and next_t>END_MS:
+                                      done=True; break
+                                  if ts<=END_MS:
+                                      last_price=price; last_ts=ts
+                                      if ts>=START_MS: trades_in_range+=1
+                      infos.append({'file':fn,'sha256':sha,'rows_parsed':parsed,'bytes':os.path.getsize(fn)})
+                      os.remove(fn); os.remove(fn+'.CHECKSUM')
+                      if done: break
+                  while next_t<=END_MS:
+                      if last_ts<0 or not math.isfinite(last_price):
+                          age=-1; missing+=1; p='nan'
+                      else:
+                          age=next_t-last_ts; max_age=max(max_age,age); p=format(last_price,'.12g')
+                      w.writerow([asset,next_t,p,last_ts,age]); rows_out+=1; next_t+=1000
+                  if rows_out!=expected_rows: raise RuntimeError(f'{asset} row count {rows_out} != {expected_rows}')
+                  manifest['assets'][asset]={'symbol':symbol,'files':infos,'rows_1s':rows_out,'missing_price_seconds':missing,'max_price_age_ms':max_age,'trades_in_range':trades_in_range}
+          with open(MAN,'w') as f: json.dump(manifest,f,indent=2)
+          print(json.dumps(manifest,indent=2),flush=True)
+          PYCODE
+      - name: Upload causal futures artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binance-futures-1s-causal-2026-09-11_17
+          path: |
+            binance_futures_1s_causal.csv.gz
+            binance_futures_1s_causal_manifest.json
+          compression-level: 0
+          retention-days: 1
